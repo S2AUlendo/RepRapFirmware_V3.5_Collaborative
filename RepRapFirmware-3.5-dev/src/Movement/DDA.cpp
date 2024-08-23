@@ -1417,6 +1417,9 @@ void DDA::Prepare(SimulationMode simMode) noexcept
 #if SUPPORT_CAN_EXPANSION
 		afterPrepare.drivesMoving.Clear();
 #endif
+		#if FTMOTION
+			makeVector();
+		#endif
 		for (size_t drive = 0; drive < MaxAxesPlusExtruders; ++drive)
 		{
 			if (flags.isLeadscrewAdjustmentMove)
