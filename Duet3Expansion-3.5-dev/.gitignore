@@ -1,0 +1,58 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Misc
+/.settings/
+
+# Output folders
+/EXP1XD/
+/EXP1XD-Debug/
+/EXP3HC/
+/EXP3HC-Debug/
+/EXP3HC-Debug-with-bootloader/
+/EXP3HC-Release-no-bootloader/
+/TOOL1LC/
+/TOOL1LC-Debug/
+/SAMMYC21/
+/SAMMYC21-Debug/
+/ATECM/
+/ATEIO/
+/EXP1HCL/
+/EXP1HCL-Debug/
+/RPiPico/
+/M23CL/
+/M23CL-Debug/
+/Fly36RRF/
+/SZP/
+/TOOL1RR/
+/F3PTB/

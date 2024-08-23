@@ -1,0 +1,536 @@
+/*
+ * DDA.h
+ *
+ *  Created on: 7 Dec 2014
+ *      Author: David
+ */
+
+#ifndef DDA_H_
+#define DDA_H_
+
+#include <RepRapFirmware.h>
+#include "DriveMovement.h"
+#include "StepTimer.h"
+#include "MoveSegment.h"
+#include <InputShaperPlan.h>
+#include <Platform/Tasks.h>
+#include <GCodes/GCodes.h>			// for class RawMove
+
+# define DDA_LOG_PROBE_CHANGES	0
+# define DDA_DEBUG_STEP_COUNT	0
+
+class DDARing;
+
+// Struct for passing parameters to the DriveMovement Prepare methods, also accessed by the input shaper
+struct PrepParams
+{
+	float totalDistance;
+	float accelDistance;
+	float decelStartDistance;
+	float accelClocks, steadyClocks, decelClocks;
+	float acceleration, deceleration;				// the acceleration and deceleration to use, both positive
+	float topSpeed;									// the top speed, may be modified by the input shaper
+	bool modified;									// true if this has been modified since we set it from the DDA
+
+	InputShaperPlan shapingPlan;
+
+#if SUPPORT_LINEAR_DELTA
+	// Parameters used only for delta moves
+	float initialX, initialY;
+# if SUPPORT_CAN_EXPANSION
+	float finalX, finalY;
+	float zMovement;
+# endif
+	const LinearDeltaKinematics *dparams;
+	float a2plusb2;									// sum of the squares of the X and Y movement fractions
+#endif
+
+	// Calculate and set the steady clocks
+	void Finalise() noexcept;
+
+	// Get the total clocks needed
+	float TotalClocks() const noexcept { return accelClocks + steadyClocks + decelClocks; }
+
+	// Set up the parameters from the DDA, excluding steadyClocks because that may be affected by input shaping
+	void SetFromDDA(const DDA& dda) noexcept;
+};
+
+// This defines a single coordinated movement of one or several motors
+class DDA
+{
+	friend class DriveMovement;
+	friend class AxisShaper;
+	friend class ExtruderShaper;
+	friend class PrepParams;
+
+public:
+
+	enum DDAState : uint8_t
+	{
+		empty,				// empty or being filled in
+		provisional,		// ready, but could be subject to modifications
+		frozen,				// ready, no further modifications allowed
+		executing,			// steps are currently being generated for this DDA
+		completed			// move has been completed or aborted
+	};
+
+	DDA(DDA* n) noexcept;
+
+	void* operator new(size_t count) { return Tasks::AllocPermanent(count); }
+	void* operator new(size_t count, std::align_val_t align) { return Tasks::AllocPermanent(count, align); }
+	void operator delete(void* ptr) noexcept {}
+	void operator delete(void* ptr, std::align_val_t align) noexcept {}
+
+	bool InitStandardMove(DDARing& ring, const RawMove &nextMove, bool doMotorMapping) noexcept SPEED_CRITICAL;	// Set up a new move, returning true if it represents real movement
+	bool InitLeadscrewMove(DDARing& ring, float feedrate, const float amounts[MaxDriversPerAxis]) noexcept;		// Set up a leadscrew motor move
+#if SUPPORT_ASYNC_MOVES
+	bool InitAsyncMove(DDARing& ring, const AsyncMove& nextMove) noexcept;			// Set up an async move
+#endif
+
+	void Start(Platform& p, uint32_t tim) noexcept SPEED_CRITICAL;					// Start executing the DDA, i.e. move the move.
+	void LatePrepareExtruders() noexcept SPEED_CRITICAL;							// Perform final preparation of extruders
+	void StepDrivers(Platform& p, uint32_t now) noexcept SPEED_CRITICAL;			// Take one step of the DDA, called by timer interrupt.
+	void SimulateSteppingDrivers(Platform& p) noexcept;								// For debugging use
+	bool ScheduleNextStepInterrupt(StepTimer& timer) const noexcept SPEED_CRITICAL;	// Schedule the next interrupt, returning true if we can't because it is already due
+
+	void SetNext(DDA *n) noexcept { next = n; }
+	void SetPrevious(DDA *p) noexcept { prev = p; }
+	void Complete() noexcept { state = completed; }
+	bool Free() noexcept;
+	void Prepare(SimulationMode simMode) noexcept SPEED_CRITICAL;					// Calculate all the values and freeze this DDA
+	bool HasStepError() const noexcept;
+	bool CanPauseAfter() const noexcept;
+	bool IsPrintingMove() const noexcept { return flags.isPrintingMove; }			// Return true if this involves both XY movement and extrusion
+	bool UsingStandardFeedrate() const noexcept { return flags.usingStandardFeedrate; }
+	bool IsCheckingEndstops() const noexcept { return flags.checkEndstops; }
+
+#if SUPPORT_SCANNING_PROBES
+	bool IsScanningProbeMove() const noexcept { return flags.scanningProbeMove; }
+#endif
+
+	DDAState GetState() const noexcept { return state; }
+	DDA* GetNext() const noexcept { return next; }
+	DDA* GetPrevious() const noexcept { return prev; }
+	int32_t GetTimeLeft() const noexcept;
+
+#if SUPPORT_CAN_EXPANSION
+	uint32_t InsertHiccup(uint32_t whenNextInterruptWanted) noexcept;
+#else
+	void InsertHiccup(uint32_t whenNextInterruptWanted) noexcept;
+#endif
+
+#if SUPPORT_REMOTE_COMMANDS
+	bool InitFromRemote(const CanMessageMovementLinear& msg) noexcept;
+	bool InitFromRemote(const CanMessageMovementLinearShaped& msg) noexcept;
+	void StopDrivers(uint16_t whichDrives) noexcept;
+#endif
+
+	const int32_t *DriveCoordinates() const noexcept { return endPoint; }			// Get endpoints of a move in machine coordinates
+	void SetDriveCoordinate(int32_t a, size_t drive) noexcept;						// Force an end point
+	void SetFeedRate(float rate) noexcept { requestedSpeed = rate; }
+	float GetEndCoordinate(size_t drive, bool disableMotorMapping) noexcept;
+	float GetRawEndCoordinate(size_t drive) const noexcept { return endCoordinates[drive]; }
+	void FetchEndPoints(int32_t ep[MaxAxesPlusExtruders]) const noexcept;
+	void FetchCurrentPositions(int32_t ep[MaxAxesPlusExtruders]) const noexcept;
+	void SetPositions(const float move[]) noexcept;									// Force the endpoints to be these
+	FilePosition GetFilePosition() const noexcept { return filePos; }
+	float GetRequestedSpeedMmPerClock() const noexcept { return requestedSpeed; }
+	float GetRequestedSpeedMmPerSec() const noexcept { return InverseConvertSpeedToMmPerSec(requestedSpeed); }
+	float GetTopSpeedMmPerSec() const noexcept { return InverseConvertSpeedToMmPerSec(topSpeed); }
+	float GetAccelerationMmPerSecSquared() const noexcept { return InverseConvertAcceleration(acceleration); }
+	float GetDecelerationMmPerSecSquared() const noexcept { return InverseConvertAcceleration(deceleration); }
+	float GetVirtualExtruderPosition() const noexcept { return virtualExtruderPosition; }
+	float GetTotalExtrusionRate() const noexcept;
+	float GetTotalDistance() const noexcept { return totalDistance; }
+
+	#if FTMOTION
+		//Returning parameters for FTM (Dilip)
+		float GetDirections(int i) const noexcept{ return *(directionVector+i); }			//Testing Added for returning direction vector - Dilip (4/4/2024)
+		float GetStartSpeedMMPerSec() const noexcept{ return InverseConvertSpeedToMmPerSec(startSpeed); }
+		float GetEndSpeedMMPerSec() const noexcept { return InverseConvertSpeedToMmPerSec(endSpeed); }
+		float GetTopSpeedMMPerSec() const noexcept { return InverseConvertSpeedToMmPerSec(topSpeed); }
+		float SetClocks(float k) noexcept {return k * 750;};
+		void makeVector() noexcept;
+	#endif
+	float AdvanceBabyStepping(DDARing& ring, size_t axis, float amount) noexcept;	// Try to push babystepping earlier in the move queue
+	const Tool *GetTool() const noexcept { return tool; }
+	float GetTotalDistance() const noexcept { return totalDistance; }
+	void LimitSpeedAndAcceleration(float maxSpeed, float maxAcceleration) noexcept;	// Limit the speed an acceleration of this move
+
+	// Filament monitor support
+	int32_t GetStepsTaken(size_t drive) const noexcept;
+
+	float GetProportionDone(bool moveWasAborted) const noexcept;					// Return the proportion of extrusion for the complete multi-segment move already done
+	float GetInitialUserC0() const noexcept { return initialUserC0; }
+	float GetInitialUserC1() const noexcept { return initialUserC1; }
+
+	void MoveAborted() noexcept;
+
+	uint32_t GetClocksNeeded() const noexcept { return clocksNeeded; }
+	bool IsGoodToPrepare() const noexcept;
+	bool IsNonPrintingExtruderMove() const noexcept { return flags.isNonPrintingExtruderMove; }
+	void UpdateMovementAccumulators(volatile int32_t *accumulators) const noexcept;
+
+#if SUPPORT_LASER || SUPPORT_IOBITS
+	LaserPwmOrIoBits GetLaserPwmOrIoBits() const noexcept { return laserPwmOrIoBits; }
+	bool ControlLaser() const noexcept { return flags.controlLaser; }
+#endif
+
+#if SUPPORT_LASER
+	uint32_t ManageLaserPower() const noexcept;										// Manage the laser power
+#endif
+
+#if SUPPORT_IOBITS
+	uint32_t GetMoveStartTime() const noexcept { return afterPrepare.moveStartTime; }
+	IoBits_t GetIoBits() const noexcept { return laserPwmOrIoBits.ioBits; }
+#endif
+
+	uint32_t GetMoveFinishTime() const noexcept { return afterPrepare.moveStartTime + clocksNeeded; }
+
+#if HAS_SMART_DRIVERS
+	uint32_t GetStepInterval(size_t axis, uint32_t microstepShift) const noexcept;	// Get the current full step interval for this axis or extruder
+#endif
+
+	DriveMovement *FindDM(size_t drive) const noexcept;								// find the DM for a drive if there is one even if it is completed
+#if SUPPORT_CAN_EXPANSION
+	bool CheckEndstops(Platform& platform) noexcept;
+#else
+	void CheckEndstops(Platform& platform) noexcept;
+#endif
+
+	void DebugPrint(const char *tag) const noexcept;								// print the DDA only
+	void DebugPrintAll(const char *tag) const noexcept;								// print the DDA and active DMs
+
+	static void PrintMoves() noexcept;												// print saved moves for debugging
+
+	// Note on the following constant:
+	// If we calculate the step interval on every clock, we reach a point where the calculation time exceeds the step interval.
+	// The worst case is pure Z movement on a delta. On a Mini Kossel with 80 steps/mm with this firmware running on a Duet (84MHx SAM3X8 processor),
+	// the calculation can just be managed in time at speeds of 15000mm/min (step interval 50us), but not at 20000mm/min (step interval 37.5us).
+	// Therefore, where the step interval falls below 60us, we don't calculate on every step.
+	// Note: the above measurements were taken some time ago, before some firmware optimisations.
+#if SAME70
+	// Use the same defaults as for the SAM4E for now.
+	static constexpr uint32_t MinCalcInterval = (40 * StepClockRate)/1000000;				// the smallest sensible interval between calculations (40us) in step timer clocks
+	static constexpr uint32_t HiccupTime = (30 * StepClockRate)/1000000;					// how long we hiccup for in step timer clocks
+#elif SAM4E || SAM4S || SAME5x
+	static constexpr uint32_t MinCalcInterval = (40 * StepClockRate)/1000000;				// the smallest sensible interval between calculations (40us) in step timer clocks
+	static constexpr uint32_t HiccupTime = (30 * StepClockRate)/1000000;					// how long we hiccup for in step timer clocks
+#else
+# error Unsupported processor
+#endif
+	static constexpr uint32_t MaxStepInterruptTime = 10 * StepTimer::MinInterruptInterval;	// the maximum time we spend looping in the ISR, in step clocks
+	static constexpr uint32_t WakeupTime = (100 * StepClockRate)/1000000;					// stop resting 100us before the move is due to end
+	static constexpr uint32_t HiccupIncrement = HiccupTime/2;								// how much we increase the hiccup time by on each attempt
+
+	static constexpr uint32_t UsualMinimumPreparedTime = StepClockRate/10;					// 100ms
+	static constexpr uint32_t AbsoluteMinimumPreparedTime = StepClockRate/20;				// 50ms
+
+#if DDA_LOG_PROBE_CHANGES
+	static const size_t MaxLoggedProbePositions = 40;
+	static size_t numLoggedProbePositions;
+	static int32_t loggedProbePositions[XYZ_AXES * MaxLoggedProbePositions];
+#endif
+
+#ifdef DUET3_MB6XD
+	static volatile uint32_t lastStepHighTime;								// when we last started a step pulse
+#else
+	static volatile uint32_t lastStepLowTime;								// when we last completed a step pulse to a slow driver
+#endif
+	static volatile uint32_t lastDirChangeTime;								// when we last change the DIR signal to a slow driver
+
+#if DDA_DEBUG_STEP_COUNT
+	static int32_t stepsRequested[NumDirectDrivers], stepsDone[NumDirectDrivers];
+#endif
+
+private:
+	static constexpr float MinimumAccelOrDecelClocks = 10.0;				// Minimum number of acceleration or deceleration clocks we try to ensure
+
+	DriveMovement *FindActiveDM(size_t drive) const noexcept;				// find the DM for a drive if there is one but only if it is active
+	void RecalculateMove(DDARing& ring) noexcept SPEED_CRITICAL;
+	void MatchSpeeds() noexcept SPEED_CRITICAL;
+	void StopDrive(size_t drive) noexcept;									// stop movement of a drive and recalculate the endpoint
+	void InsertDM(DriveMovement *dm) noexcept SPEED_CRITICAL;
+	void DeactivateDM(size_t drive) noexcept;
+	void ReleaseDMs() noexcept;
+	bool IsDecelerationMove() const noexcept;								// return true if this move is or have been might have been intended to be a deceleration-only move
+	bool IsAccelerationMove() const noexcept;								// return true if this move is or have been might have been intended to be an acceleration-only move
+	void EnsureSegments(const PrepParams& params) noexcept;
+	void ReleaseSegments() noexcept;
+	void DebugPrintVector(const char *name, const float *vec, size_t len) const noexcept;
+
+#if SUPPORT_CAN_EXPANSION
+	int32_t PrepareRemoteExtruder(size_t drive, float& extrusionPending, float speedChange) const noexcept;
+#endif
+
+	static void DoLookahead(DDARing& ring, DDA *laDDA) noexcept SPEED_CRITICAL;	// Try to smooth out moves in the queue
+    static float Normalise(float v[], AxesBitmap unitLengthAxes) noexcept;  // Normalise a vector to unit length over the specified axes
+    static float Normalise(float v[]) noexcept; 							// Normalise a vector to unit length over all axes
+	float NormaliseLinearMotion(AxesBitmap linearAxes) noexcept;			// Make the direction vector unit-normal in XYZ
+    static void Absolute(float v[], size_t dimensions) noexcept;			// Put a vector in the positive hyperquadrant
+
+    static float Magnitude(const float v[]) noexcept;						// Get the magnitude measured over all axes and extruders
+    static float Magnitude(const float v[], AxesBitmap axes) noexcept;  	// Return the length of a vector over the specified orthogonal axes
+    static void Scale(float v[], float scale) noexcept;						// Multiply a vector by a scalar
+    static float VectorBoxIntersection(const float v[], const float box[]) noexcept;	// Compute the length that a vector would have to have to just touch the surface of a hyperbox of MaxAxesPlusExtruders dimensions.
+
+    DDA *next;										// The next one in the ring
+	DDA *prev;										// The previous one in the ring
+
+	volatile DDAState state;						// What state this DDA is in
+
+	union
+	{
+		struct
+		{
+			uint16_t endCoordinatesValid : 1,		// True if endCoordinates can be relied
+#if SUPPORT_LINEAR_DELTA
+					 isDeltaMovement : 1,			// True if this is a delta printer movement
+#endif
+					 canPauseAfter : 1,				// True if we can pause at the end of this move
+					 isPrintingMove : 1,			// True if this move includes XY movement and extrusion
+					 usePressureAdvance : 1,		// True if pressure advance should be applied to any forward extrusion
+					 hadLookaheadUnderrun : 1,		// True if the lookahead queue was not long enough to optimise this move
+					 xyMoving : 1,					// True if movement along an X axis or a Y axis was requested, even it if's too small to do
+					 isLeadscrewAdjustmentMove : 1,	// True if this is a leadscrews adjustment move
+					 usingStandardFeedrate : 1,		// True if this move uses the standard feed rate
+					 isNonPrintingExtruderMove : 1,	// True if this move is an extruder-only move, or involves reverse extrusion (and possibly axis movement too)
+					 continuousRotationShortcut : 1, // True if continuous rotation axes take shortcuts
+					 checkEndstops : 1,				// True if this move monitors endstops or Z probe
+					 controlLaser : 1,				// True if this move controls the laser or iobits
+#if SUPPORT_SCANNING_PROBES
+					 scanningProbeMove : 1,	 	 	// True if this is a scanning Z probe move
+#endif
+					 isRemote : 1,					// True if this move was commanded from a remote
+					 wasAccelOnlyMove : 1;			// set by Prepare if this was an acceleration-only move, for the next move to look at
+		};
+		uint16_t all;								// so that we can print all the flags at once for debugging
+	} flags;
+
+#if SUPPORT_LASER || SUPPORT_IOBITS
+	LaserPwmOrIoBits laserPwmOrIoBits;				// laser PWM required or port state required during this move (here because it is currently 16 bits)
+#endif
+
+	const Tool *tool;								// which tool (if any) is active
+
+    FilePosition filePos;							// The position in the SD card file after this move was read, or zero if not read from SD card
+
+	int32_t endPoint[MaxAxesPlusExtruders];  		// Machine coordinates of the endpoint
+	float endCoordinates[MaxAxesPlusExtruders];		// The Cartesian coordinates at the end of the move plus extrusion amounts
+	float directionVector[MaxAxesPlusExtruders];	// The normalised direction vector - first 3 are XYZ Cartesian coordinates even on a delta
+    float totalDistance;							// How long is the move in hypercuboid space
+	float acceleration;								// The acceleration to use, always positive
+	float deceleration;								// The deceleration to use, always positive
+    float requestedSpeed;							// The speed that the user asked for
+    float virtualExtruderPosition;					// the virtual extruder position at the end of this move, used for pause/resume
+
+    // These vary depending on how we connect the move with its predecessor and successor, but remain constant while the move is being executed
+	float startSpeed;
+	float endSpeed;
+	float topSpeed;
+
+	float proportionDone;							// what proportion of the extrusion in the G1 or G0 move of which this is a part has been done after this segment is complete
+	float initialUserC0, initialUserC1;				// if this is a segment of an arc move, the user X and Y coordinates at the start
+	uint32_t clocksNeeded;
+
+#if FTMOTION
+		struct {
+
+			float ft_acceleration, ft_deceleration;
+			u_int8_t direction;
+			float T1, T2, T3;
+			float onebyf, oneby2a, oneby2d;
+			float Fsquare, feSqByTwoD, fsSqByTwoA;
+			float T1_P, T2_P, T3_P;
+			float TX_demon;
+			float fst1, fet3;
+		} ftmParam;
+
+		float startDist[MaxAxes];
+
+		// used during calculate dist - fast access required
+		float totalLength;							// copy of the total length of the move
+		uint32_t maxInterval;
+		uint32_t N1, N2, N3;						// the fixed time intervals for acceleration, deceleration and the end of the move
+		float accel_P; 								// adjusted acceleration
+		float decel_P;								// adjusted deceleration
+		float s_1e, s_2e;
+		float F_n; 									// adjusted nominal speed
+		float f_s; 									// adjusted start speed -- lookahead should already have been performed when this value is set
+		float f_e;									// adjusted end speed
+		float F_P;
+		float tau;
+		int8_t flag;
+		uint32_t N1N21, N1N2, N11;
+		const float FTHalf = 0.5;
+		const float fixedTimeInterval = 0.001;		// in mm/s
+		const float fixedTimeRate = 1000;			// in Hz
+	#endif
+	union
+	{
+		// Values that are needed only before Prepare is called and in the first few lines of Prepare
+		struct
+		{
+			float accelDistance;
+			float decelDistance;
+			float targetNextSpeed;					// The speed that the next move would like to start at, used to keep track of the lookahead without making recursive calls
+		} beforePrepare;
+
+		// Values that are not set or accessed before Prepare is called
+		struct
+		{
+			// These are calculated from the above and used in the ISR, so they are set up by Prepare()
+			uint32_t moveStartTime;					// clock count at which the move is due to start (before execution) or was started (during execution)
+			float averageExtrusionSpeed;			// the average extrusion speed in mm/sec, for applying heater feedforward
+
+#if SUPPORT_CAN_EXPANSION
+			AxesBitmap drivesMoving;				// bitmap of logical drives moving - needed to keep track of whether remote drives are moving
+#endif
+		} afterPrepare;
+	};
+
+#if DDA_LOG_PROBE_CHANGES
+	static bool probeTriggered;
+
+	void LogProbePosition() noexcept;
+#endif
+
+	// These three could possibly be moved into afterPrepare
+	DriveMovement* activeDMs;						// list of associated DMs that need steps, in step time order
+	DriveMovement* completedDMs;					// list of associated DMs that don't need any more steps
+	MoveSegment* segments;							// linked list of move segments used by axis DMs
+};
+
+// Find the DriveMovement record for a given drive even if it is completed, or return nullptr if there isn't one
+inline DriveMovement *DDA::FindDM(size_t drive) const noexcept
+{
+	for (DriveMovement* dm = activeDMs; dm != nullptr; dm = dm->nextDM)
+	{
+		if (dm->drive == drive)
+		{
+			return dm;
+		}
+	}
+	for (DriveMovement* dm = completedDMs; dm != nullptr; dm = dm->nextDM)
+	{
+		if (dm->drive == drive)
+		{
+			return dm;
+		}
+	}
+	return nullptr;
+}
+
+// Find the active DriveMovement record for a given drive, or return nullptr if there isn't one
+inline DriveMovement *DDA::FindActiveDM(size_t drive) const noexcept
+{
+	for (DriveMovement* dm = activeDMs; dm != nullptr; dm = dm->nextDM)
+	{
+		if (dm->drive == drive)
+		{
+			return dm;
+		}
+	}
+	return nullptr;
+}
+
+// Force an end point
+inline void DDA::SetDriveCoordinate(int32_t a, size_t drive) noexcept
+{
+	endPoint[drive] = a;
+	flags.endCoordinatesValid = false;
+}
+
+// Schedule the next interrupt, returning true if we can't because it is already due
+// Base priority must be >= NvicPriorityStep when calling this
+inline __attribute__((always_inline)) bool DDA::ScheduleNextStepInterrupt(StepTimer& timer) const noexcept
+{
+	if (state == executing)
+	{
+		// Calculate the time when we want the next interrupt.
+		// This must be after the move is due to start, because if the interrupt is too early then DDA::Step will just reschedule the interrupt again.
+		// This leads to the ISR looping, eventually inserting ever-larger hiccups, and the print stalls.
+		uint32_t whenDue;
+		if (activeDMs != nullptr)
+		{
+			whenDue = activeDMs->nextStepTime + afterPrepare.moveStartTime;
+		}
+		else if (clocksNeeded > DDA::WakeupTime)
+		{
+			whenDue = clocksNeeded - DDA::WakeupTime + afterPrepare.moveStartTime;
+		}
+		else
+		{
+			// This case occurs when we have a very short null movement
+			whenDue = afterPrepare.moveStartTime;
+		}
+		return timer.ScheduleCallbackFromIsr(whenDue);
+	}
+	return false;
+}
+
+// Return true if there is no reason to delay preparing this move
+inline bool DDA::IsGoodToPrepare() const noexcept
+{
+	return endSpeed >= topSpeed;							// if it never decelerates, we can't improve it
+}
+
+inline bool DDA::CanPauseAfter() const noexcept
+{
+	return flags.canPauseAfter
+#if SUPPORT_CAN_EXPANSION
+		// We can't easily cancel moves that have already been sent to CAN expansion boards
+		&& next->state != DDAState::frozen
+#endif
+		;
+}
+
+// Return the number of net steps already taken in this move by a particular drive
+inline int32_t DDA::GetStepsTaken(size_t drive) const noexcept
+{
+	const DriveMovement * const dmp = FindDM(drive);
+	return (dmp != nullptr) ? dmp->GetNetStepsTaken() : 0;
+}
+
+// This is called by DDARing::LiveCoordinates to get the endpoints of a move that has been completed
+inline void DDA::FetchEndPoints(int32_t ep[MaxAxesPlusExtruders]) const noexcept
+{
+	memcpyi32(ep, endPoint, MaxAxesPlusExtruders);
+}
+
+#if SUPPORT_CAN_EXPANSION
+
+// Insert a hiccup, returning the amount of time inserted
+// Note, clocksNeeded may be less than DDA:WakeupTime but that doesn't matter, the subtraction will wrap around and push the new moveStartTime on a little
+inline __attribute__((always_inline)) uint32_t DDA::InsertHiccup(uint32_t whenNextInterruptWanted) noexcept
+{
+	const uint32_t ticksDueAfterStart = (activeDMs != nullptr) ? activeDMs->nextStepTime : clocksNeeded - DDA::WakeupTime;
+	const uint32_t oldStartTime = afterPrepare.moveStartTime;
+	afterPrepare.moveStartTime = whenNextInterruptWanted - ticksDueAfterStart;
+	return afterPrepare.moveStartTime - oldStartTime;
+}
+
+#else
+
+// Insert a hiccup
+// Note, clocksNeeded may be less than DDA:WakeupTime but that doesn't matter, the subtraction will wrap around and push the new moveStartTime on a little
+inline __attribute__((always_inline)) void DDA::InsertHiccup(uint32_t whenNextInterruptWanted) noexcept
+{
+	const uint32_t ticksDueAfterStart = (activeDMs != nullptr) ? activeDMs->nextStepTime : clocksNeeded - DDA::WakeupTime;
+	afterPrepare.moveStartTime = whenNextInterruptWanted - ticksDueAfterStart;
+}
+
+#endif
+
+#if HAS_SMART_DRIVERS
+
+// Get the current full step interval for this axis or extruder
+inline __attribute__((always_inline)) uint32_t DDA::GetStepInterval(size_t axis, uint32_t microstepShift) const noexcept
+{
+	const DriveMovement * const dm = FindActiveDM(axis);
+	return (dm != nullptr) ? dm->GetStepInterval(microstepShift) : 0;
+}
+
+#endif
+
+#endif /* DDA_H_ */
